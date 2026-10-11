@@ -95,7 +95,7 @@ Contrôles utiles : `kubectl -n studio3d port-forward svc/studio 8000:8000` puis
 
 - Module suivant : **Passer le studio à l'échelle** (file Redis partagée, plusieurs workers
   Blender, mise à l'échelle automatique par KEDA) — dépôt
-  `clic-par-clic-studio3d-02-…` (à venir).
+  [`clic-par-clic-studio3d-02-echelle`](https://github.com/guilhem-/clic-par-clic-studio3d-02-echelle).
 
 ## Licence
 
