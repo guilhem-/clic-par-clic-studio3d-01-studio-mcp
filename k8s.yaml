@@ -1,0 +1,80 @@
+# Studio 3D de l'organisation, version simple : un pod, une file en mémoire, un rendu à la fois.
+#   kubectl -n studio3d create secret generic studio --from-literal=jeton=<jeton>   (voir README.md)
+#   kubectl apply -f k8s.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: studio3d
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: studio
+  namespace: studio3d
+spec:
+  replicas: 1                      # une seule file, un rendu à la fois (plusieurs workers : module suivant)
+  selector:
+    matchLabels: { app: studio }
+  template:
+    metadata:
+      labels: { app: studio }
+    spec:
+      containers:
+        - name: studio
+          image: studio3d:1
+          imagePullPolicy: IfNotPresent   # image importée par « k3d image import », pas de registre
+          ports: [{ containerPort: 8000 }]
+          env:
+            - name: STUDIO_JETON
+              valueFrom: { secretKeyRef: { name: studio, key: jeton } }
+            - name: STUDIO_PUBLIC_URL
+              value: http://studio.localhost:8080
+            - name: DUREE_MAX
+              value: "300"
+          resources:
+            requests: { cpu: "2", memory: 2Gi }
+            limits: { cpu: "8", memory: 6Gi }
+          readinessProbe:
+            httpGet: { path: /sante, port: 8000 }
+            periodSeconds: 5
+          volumeMounts: [{ name: rendus, mountPath: /data/rendus }]
+      volumes:
+        - name: rendus
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: studio
+  namespace: studio3d
+spec:
+  selector: { app: studio }
+  ports: [{ port: 8000, targetPort: 8000 }]
+---
+# Seuls les fichiers rendus (liens signés /r/…) sont publiés hors du cluster ; le point MCP
+# (/mcp) reste interne, joint par Open WebUI via le service.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: studio
+  namespace: studio3d
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: studio.localhost
+      http:
+        paths:
+          - path: /r/
+            pathType: Prefix
+            backend: { service: { name: studio, port: { number: 8000 } } }
+---
+# Isolation : le code écrit par le modèle s'exécute dans ce pod, qui n'a aucun accès sortant.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: studio-sans-sortie
+  namespace: studio3d
+spec:
+  podSelector: { matchLabels: { app: studio } }
+  policyTypes: [Egress]
+  egress: []
