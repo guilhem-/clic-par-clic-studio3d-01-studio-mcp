@@ -1,5 +1,5 @@
-# Studio 3D de l'organisation, version simple : un pod, une file en mémoire, un rendu à la fois.
-#   kubectl -n studio3d create secret generic studio --from-literal=jeton=<jeton>   (voir README.md)
+# The organization's 3D studio, simple version: one pod, an in-memory queue, one render at a time.
+#   kubectl -n studio3d create secret generic studio --from-literal=token=<token>   (see README.md)
 #   kubectl apply -f k8s.yaml
 apiVersion: v1
 kind: Namespace
@@ -12,7 +12,7 @@ metadata:
   name: studio
   namespace: studio3d
 spec:
-  replicas: 1                      # une seule file, un rendu à la fois (plusieurs workers : module suivant)
+  replicas: 1                      # a single queue, one render at a time (several workers: next module)
   selector:
     matchLabels: { app: studio }
   template:
@@ -22,24 +22,24 @@ spec:
       containers:
         - name: studio
           image: studio3d:1
-          imagePullPolicy: IfNotPresent   # image importée par « k3d image import », pas de registre
+          imagePullPolicy: IfNotPresent   # image imported by "k3d image import", no registry
           ports: [{ containerPort: 8000 }]
           env:
-            - name: STUDIO_JETON
-              valueFrom: { secretKeyRef: { name: studio, key: jeton } }
+            - name: STUDIO_TOKEN
+              valueFrom: { secretKeyRef: { name: studio, key: token } }
             - name: STUDIO_PUBLIC_URL
               value: http://studio.localhost:8080
-            - name: DUREE_MAX
+            - name: MAX_DURATION
               value: "300"
           resources:
             requests: { cpu: "2", memory: 2Gi }
             limits: { cpu: "8", memory: 6Gi }
           readinessProbe:
-            httpGet: { path: /sante, port: 8000 }
+            httpGet: { path: /health, port: 8000 }
             periodSeconds: 5
-          volumeMounts: [{ name: rendus, mountPath: /data/rendus }]
+          volumeMounts: [{ name: renders, mountPath: /data/renders }]
       volumes:
-        - name: rendus
+        - name: renders
           emptyDir: {}
 ---
 apiVersion: v1
@@ -51,8 +51,8 @@ spec:
   selector: { app: studio }
   ports: [{ port: 8000, targetPort: 8000 }]
 ---
-# Seuls les fichiers rendus (liens signés /r/…) sont publiés hors du cluster ; le point MCP
-# (/mcp) reste interne, joint par Open WebUI via le service.
+# Only the rendered files (signed links /r/…) are published outside the cluster; the MCP
+# endpoint (/mcp) stays internal, reached by Open WebUI through the service.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -68,11 +68,11 @@ spec:
             pathType: Prefix
             backend: { service: { name: studio, port: { number: 8000 } } }
 ---
-# Isolation : le code écrit par le modèle s'exécute dans ce pod, qui n'a aucun accès sortant.
+# Isolation: the code written by the model runs in this pod, which has no outbound access.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: studio-sans-sortie
+  name: studio-no-egress
   namespace: studio3d
 spec:
   podSelector: { matchLabels: { app: studio } }

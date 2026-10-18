@@ -1,9 +1,9 @@
-"""Studio 3D de l'organisation : serveur MCP (HTTP, sans session) et file de rendus Blender.
+"""The organization's 3D studio: MCP server (HTTP, stateless) and a queue of Blender renders.
 
-Open WebUI l'appelle avec un jeton partagé (Authorization: Bearer) et l'adresse de
-l'utilisateur (X-Utilisateur-Email, modèle {{USER_EMAIL}}). Chaque demande passe dans une
-file ; un Blender neuf (« blender -b ») la rend, avec une durée maximale. Les fichiers
-produits sont servis par des liens signés, courts, lisibles depuis le navigateur (CORS).
+Open WebUI calls it with a shared token (Authorization: Bearer) and the user's address
+(X-User-Email, template {{USER_EMAIL}}). Each request goes into a queue; a fresh Blender
+("blender -b") renders it, with a maximum duration. The files produced are served through
+short signed links, readable from the browser (CORS).
 """
 import asyncio
 import hashlib
@@ -17,172 +17,172 @@ from mcp.server.fastmcp import Context, FastMCP
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
 
-JETON = os.environ["STUDIO_JETON"]
-SECRET = os.environ.get("STUDIO_SECRET", JETON).encode()
+TOKEN = os.environ["STUDIO_TOKEN"]
+SECRET = os.environ.get("STUDIO_SECRET", TOKEN).encode()
 PUBLIC = os.environ.get("STUDIO_PUBLIC_URL", "http://studio.localhost:8080").rstrip("/")
 BLENDER = os.environ.get("BLENDER", "/opt/blender/blender")
-RENDU = Path(__file__).with_name("rendu.py")
-DOSSIER = Path(os.environ.get("DOSSIER", "/data/rendus"))
-DUREE_MAX = int(os.environ.get("DUREE_MAX", "300"))
+RENDER = Path(__file__).with_name("render.py")
+FOLDER = Path(os.environ.get("RENDERS", "/data/renders"))
+MAX_DURATION = int(os.environ.get("MAX_DURATION", "300"))
 
 mcp = FastMCP("studio", host="0.0.0.0", port=8000, stateless_http=True)
-demandes: dict[int, dict] = {}
-file_attente: asyncio.Queue[int] = asyncio.Queue()
-_travailleur: asyncio.Task | None = None
+requests: dict[int, dict] = {}
+queue: asyncio.Queue[int] = asyncio.Queue()
+_worker: asyncio.Task | None = None
 
 
-# ---------------------------------------------------------------- Identité et liens
+# ---------------------------------------------------------------- Identity and links
 
-def _utilisateur(ctx: Context) -> str:
-    requete = ctx.request_context.request
-    entetes = requete.headers if requete is not None else {}
-    if entetes.get("authorization", "") != f"Bearer {JETON}":
-        raise PermissionError("jeton du studio invalide")
-    email = entetes.get("x-utilisateur-email", "").strip().lower()
+def _user(ctx: Context) -> str:
+    request = ctx.request_context.request
+    headers = request.headers if request is not None else {}
+    if headers.get("authorization", "") != f"Bearer {TOKEN}":
+        raise PermissionError("invalid studio token")
+    email = headers.get("x-user-email", "").strip().lower()
     if not email:
-        raise PermissionError("utilisateur inconnu : en-tête X-Utilisateur-Email absent")
+        raise PermissionError("unknown user: X-User-Email header missing")
     return email
 
 
-def _signature(numero: int, extension: str) -> str:
-    return hmac.new(SECRET, f"{numero}.{extension}".encode(), hashlib.sha256).hexdigest()[:10]
+def _signature(number: int, extension: str) -> str:
+    return hmac.new(SECRET, f"{number}.{extension}".encode(), hashlib.sha256).hexdigest()[:10]
 
 
-def _lien(numero: int, extension: str) -> str:
-    return f"{PUBLIC}/r/{numero}/{_signature(numero, extension)}.{extension}"
+def _link(number: int, extension: str) -> str:
+    return f"{PUBLIC}/r/{number}/{_signature(number, extension)}.{extension}"
 
 
-def _artefact(numero: int, titre: str) -> str:
+def _artifact(number: int, title: str) -> str:
     return (
         '```html\n'
         '<script type="module" src="https://cdn.jsdelivr.net/npm/@google/model-viewer@4.0.0/dist/model-viewer.min.js"></script>\n'
-        f'<model-viewer src="{_lien(numero, "glb")}" poster="{_lien(numero, "png")}" alt="{titre}" '
+        f'<model-viewer src="{_link(number, "glb")}" poster="{_link(number, "png")}" alt="{title}" '
         'camera-controls auto-rotate shadow-intensity="1" '
         'style="width:100%;height:480px;background:#f4f4f5"></model-viewer>\n'
         '```'
     )
 
 
-# ---------------------------------------------------------------- File et rendu
+# ---------------------------------------------------------------- Queue and rendering
 
-def _position(numero: int) -> int:
-    """Position dans la file : 1 = la prochaine à passer ; le rendu en cours compte."""
-    avant = sum(1 for n, d in demandes.items() if n < numero and d["statut"] in ("en_attente", "en_cours"))
-    return 1 + avant
+def _position(number: int) -> int:
+    """Position in the queue: 1 = the next one to run; the render in progress counts."""
+    before = sum(1 for n, d in requests.items() if n < number and d["status"] in ("queued", "running"))
+    return 1 + before
 
 
-async def _travailler() -> None:
+async def _work() -> None:
     while True:
-        numero = await file_attente.get()
-        d = demandes[numero]
-        d.update(statut="en_cours", debut=time.time())
-        dossier = DOSSIER / str(numero)
-        dossier.mkdir(parents=True, exist_ok=True)
-        (dossier / "scene.py").write_text(d["code"], encoding="utf-8")
+        number = await queue.get()
+        d = requests[number]
+        d.update(status="running", started=time.time())
+        folder = FOLDER / str(number)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "scene.py").write_text(d["code"], encoding="utf-8")
         try:
             proc = await asyncio.create_subprocess_exec(
-                BLENDER, "-b", "--factory-startup", "--python", str(RENDU), "--", str(dossier),
+                BLENDER, "-b", "--factory-startup", "--python", str(RENDER), "--", str(folder),
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             )
             try:
-                sortie, _ = await asyncio.wait_for(proc.communicate(), DUREE_MAX)
+                output, _ = await asyncio.wait_for(proc.communicate(), MAX_DURATION)
             except asyncio.TimeoutError:
                 proc.kill()
-                raise RuntimeError(f"rendu interrompu après {DUREE_MAX} s")
-            resultat = dossier / "resultat.json"
-            if not resultat.exists():
-                lignes = sortie.decode(errors="replace").strip().splitlines()
-                raise RuntimeError("\n".join(lignes[-12:]) or "Blender n'a rien produit")
-            info = json.loads(resultat.read_text(encoding="utf-8"))
-            if info.get("erreur"):
-                raise RuntimeError(info["erreur"])
-            d.update(statut="termine", fin=time.time())
-        except Exception as e:  # le message revient au modèle, qui peut corriger et resoumettre
-            d.update(statut="erreur", fin=time.time(), erreur=str(e)[-1500:])
+                raise RuntimeError(f"render stopped after {MAX_DURATION} s")
+            result = folder / "result.json"
+            if not result.exists():
+                lines = output.decode(errors="replace").strip().splitlines()
+                raise RuntimeError("\n".join(lines[-12:]) or "Blender produced nothing")
+            info = json.loads(result.read_text(encoding="utf-8"))
+            if info.get("error"):
+                raise RuntimeError(info["error"])
+            d.update(status="done", finished=time.time())
+        except Exception as e:  # the message goes back to the model, which can fix the code and submit again
+            d.update(status="error", finished=time.time(), error=str(e)[-1500:])
         finally:
-            file_attente.task_done()
+            queue.task_done()
 
 
-def _demarrer_travailleur() -> None:
-    global _travailleur
-    if _travailleur is None or _travailleur.done():
-        _travailleur = asyncio.get_running_loop().create_task(_travailler())
+def _start_worker() -> None:
+    global _worker
+    if _worker is None or _worker.done():
+        _worker = asyncio.get_running_loop().create_task(_work())
 
 
-# ---------------------------------------------------------------- Outils MCP
-
-@mcp.tool()
-async def soumettre_rendu(titre: str, code: str, ctx: Context) -> dict:
-    """Met en file d'attente le rendu d'une scène Blender et répond immédiatement.
-
-    code : script Python (bpy) qui construit la scène dans une scène vide : objets, matériaux,
-    lumière, caméra. Ne pas régler le moteur ni enregistrer : le studio s'en charge
-    (Cycles, 1280 x 720, PNG + modèle 3D GLB). Les objets de décor (sol, fond) doivent avoir
-    un nom commençant par « Decor » : ils sont rendus mais pas exportés dans le modèle 3D.
-    Renvoie le numéro de la demande et sa position dans la file."""
-    utilisateur = _utilisateur(ctx)
-    numero = max(demandes, default=0) + 1
-    demandes[numero] = {"numero": numero, "titre": titre[:80], "code": code, "utilisateur": utilisateur,
-                        "statut": "en_attente", "soumis": time.time()}
-    _demarrer_travailleur()
-    await file_attente.put(numero)
-    return {"numero": numero, "titre": titre, "position": _position(numero),
-            "message": "Demande enregistrée. Le rendu prend une à deux minutes ; demandez son état avec etat_rendu."}
-
+# ---------------------------------------------------------------- MCP tools
 
 @mcp.tool()
-def etat_rendu(numero: int, ctx: Context) -> dict:
-    """Donne l'état d'une demande de l'utilisateur : en_attente (avec sa position), en_cours,
-    termine (avec l'image en Markdown et l'artefact 3D à recopier tels quels) ou erreur."""
-    utilisateur = _utilisateur(ctx)
-    d = demandes.get(numero)
-    if d is None or d["utilisateur"] != utilisateur:
-        return {"numero": numero, "erreur": "aucune demande de ce numéro pour cet utilisateur"}
-    etat = {"numero": numero, "titre": d["titre"], "statut": d["statut"]}
-    if d["statut"] == "en_attente":
-        etat["position"] = _position(numero)
-    elif d["statut"] == "en_cours":
-        etat["depuis_secondes"] = round(time.time() - d["debut"])
-    elif d["statut"] == "termine":
-        etat["duree_secondes"] = round(d["fin"] - d["debut"])
-        etat["image_markdown"] = f'![{d["titre"]}]({_lien(numero, "png")})'
-        etat["artefact_3d"] = _artefact(numero, d["titre"])
+async def submit_render(title: str, code: str, ctx: Context) -> dict:
+    """Queues the render of a Blender scene and answers immediately.
+
+    code: Python script (bpy) that builds the scene in an empty scene: objects, materials,
+    light, camera. Do not set the render engine or save anything: the studio does it
+    (Cycles, 1280 x 720, PNG + GLB 3D model). Decor objects (floor, background) must have
+    a name starting with "Decor": they are rendered but not exported in the 3D model.
+    Returns the request number and its position in the queue."""
+    user = _user(ctx)
+    number = max(requests, default=0) + 1
+    requests[number] = {"number": number, "title": title[:80], "code": code, "user": user,
+                        "status": "queued", "submitted": time.time()}
+    _start_worker()
+    await queue.put(number)
+    return {"number": number, "title": title, "position": _position(number),
+            "message": "Request recorded. Rendering takes one to two minutes; ask for its status with render_status."}
+
+
+@mcp.tool()
+def render_status(number: int, ctx: Context) -> dict:
+    """Gives the status of one of the user's requests: queued (with its position), running,
+    done (with the image in Markdown and the 3D artifact to copy as is) or error."""
+    user = _user(ctx)
+    d = requests.get(number)
+    if d is None or d["user"] != user:
+        return {"number": number, "error": "no request with this number for this user"}
+    status = {"number": number, "title": d["title"], "status": d["status"]}
+    if d["status"] == "queued":
+        status["position"] = _position(number)
+    elif d["status"] == "running":
+        status["running_seconds"] = round(time.time() - d["started"])
+    elif d["status"] == "done":
+        status["duration_seconds"] = round(d["finished"] - d["started"])
+        status["image_markdown"] = f'![{d["title"]}]({_link(number, "png")})'
+        status["model_3d"] = _artifact(number, d["title"])
     else:
-        etat["erreur"] = d.get("erreur", "")
-    return etat
+        status["error"] = d.get("error", "")
+    return status
 
 
 @mcp.tool()
-def mes_rendus(ctx: Context) -> list[dict]:
-    """Liste les demandes de l'utilisateur connecté, de la plus récente à la plus ancienne."""
-    utilisateur = _utilisateur(ctx)
-    return [{"numero": d["numero"], "titre": d["titre"], "statut": d["statut"]}
-            for d in sorted(demandes.values(), key=lambda d: -d["numero"]) if d["utilisateur"] == utilisateur]
+def my_renders(ctx: Context) -> list[dict]:
+    """Lists the signed-in user's requests, most recent first."""
+    user = _user(ctx)
+    return [{"number": d["number"], "title": d["title"], "status": d["status"]}
+            for d in sorted(requests.values(), key=lambda d: -d["number"]) if d["user"] == user]
 
 
-# ---------------------------------------------------------------- Fichiers (liens signés)
+# ---------------------------------------------------------------- Files (signed links)
 
-@mcp.custom_route("/r/{numero}/{fichier}", methods=["GET"])
-async def fichier(request: Request) -> Response:
+@mcp.custom_route("/r/{number}/{name}", methods=["GET"])
+async def serve(request: Request) -> Response:
     try:
-        numero = int(request.path_params["numero"])
-        signature, extension = request.path_params["fichier"].rsplit(".", 1)
+        number = int(request.path_params["number"])
+        signature, extension = request.path_params["name"].rsplit(".", 1)
     except ValueError:
         return Response(status_code=404)
-    nom = {"png": "rendu.png", "glb": "modele.glb"}.get(extension)
-    chemin = DOSSIER / str(numero) / (nom or "")
-    if not nom or not hmac.compare_digest(signature, _signature(numero, extension)) or not chemin.is_file():
+    name = {"png": "render.png", "glb": "model.glb"}.get(extension)
+    path = FOLDER / str(number) / (name or "")
+    if not name or not hmac.compare_digest(signature, _signature(number, extension)) or not path.is_file():
         return Response(status_code=404)
-    return FileResponse(chemin, headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "private, max-age=3600"},
+    return FileResponse(path, headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "private, max-age=3600"},
                         media_type="image/png" if extension == "png" else "model/gltf-binary")
 
 
-@mcp.custom_route("/sante", methods=["GET"])
-async def sante(request: Request) -> Response:
-    return JSONResponse({"ok": True, "demandes": len(demandes), "en_attente": file_attente.qsize(),
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request) -> Response:
+    return JSONResponse({"ok": True, "requests": len(requests), "queued": queue.qsize(),
                          "blender": Path(BLENDER).exists()})
 
 
 if __name__ == "__main__":
-    DOSSIER.mkdir(parents=True, exist_ok=True)
+    FOLDER.mkdir(parents=True, exist_ok=True)
     mcp.run(transport="streamable-http")

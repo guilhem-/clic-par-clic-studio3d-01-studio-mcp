@@ -1,103 +1,103 @@
-# Un studio 3D pour toute l'organisation — serveur MCP et Blender dans Kubernetes
+# A 3D studio for the whole organization — MCP server and Blender on Kubernetes
 
-Code de la démonstration du module 1 de la série « Clic par clic » **Créer un service d'IA
-compatible agentique : le studio 3D**.
+Code for module 1 of the “Click by Click” series **Building an agent-ready AI service: the 3D studio**
+(also published in French as « Clic par clic » and in German as « Klick für Klick »).
 
-Vidéo : {{video}}
+Video: {{video}}
 
-## But
+## Goal
 
-Un service d'intelligence artificielle partagé par toute l'organisation, que les assistants
-d'Open WebUI appellent par **MCP** :
+An artificial intelligence service shared by the whole organization, which Open WebUI assistants
+call over **MCP**:
 
-- l'utilisateur demande une image en langage naturel ; le modèle écrit le code Python (`bpy`) de
-  la scène et appelle l'outil `soumettre_rendu` ;
-- le studio range la demande dans une **file** et répond aussitôt par un numéro ;
-- un **Blender 5.2 sans interface** calcule l'image (Cycles, 1280 × 720) et le modèle 3D (GLB) ;
-- les fichiers reviennent par des **liens signés**, lisibles par un artefact `<model-viewer>` ;
-- l'**identité** de l'utilisateur (en-tête `X-Utilisateur-Email`, rempli par Open WebUI) range
-  chaque demande à son nom : chacun ne voit que ses rendus ;
-- une **règle réseau sans sortie** isole le code écrit par le modèle.
+- the user asks for an image in plain language; the model writes the Python code (`bpy`) of the
+  scene and calls the `submit_render` tool;
+- the studio puts the request in a **queue** and answers right away with a number;
+- a **headless Blender 5.2** renders the image (Cycles, 1280 × 720) and the 3D model (GLB);
+- the files come back through **signed links**, readable by a `<model-viewer>` artifact;
+- the user's **identity** (`X-User-Email` header, filled in by Open WebUI) files each request under
+  their name: everyone sees only their own renders;
+- a **network rule with no egress** isolates the code written by the model.
 
-Version volontairement simple : un seul pod, une file en mémoire, un rendu à la fois.
+Deliberately simple version: a single pod, an in-memory queue, one render at a time.
 
-## Contenu
+## Contents
 
-| Fichier | Rôle |
+| File | Role |
 |---|---|
-| `studio/studio.py` | Serveur MCP (FastMCP, HTTP sans session) : outils `soumettre_rendu`, `etat_rendu`, `mes_rendus`, file, liens signés `/r/…`, santé `/sante` |
-| `studio/rendu.py` | Exécuté par Blender sans interface : construit la scène, ajoute caméra et lumière au besoin, rend l'image, exporte le GLB |
-| `studio/Dockerfile` | Image : Python 3.12, Blender 5.2 (miroir officiel, empreinte SHA-256 vérifiée), serveur MCP |
-| `k8s.yaml` | Espace de noms `studio3d`, déploiement, service, publication des seuls rendus (Traefik), règle réseau sans sortie |
-| `open-webui/entetes.json` | En-tête d'identité à coller dans la connexion MCP d'Open WebUI |
-| `open-webui/consignes-modele.txt` | Prompt système du modèle « Studio 3D » |
-| `.env.example` | Variable à renseigner (jeton partagé), sans valeur |
+| `studio/studio.py` | MCP server (FastMCP, stateless HTTP): tools `submit_render`, `render_status`, `my_renders`, queue, signed links `/r/…`, health check `/health` |
+| `studio/render.py` | Run by headless Blender: builds the scene, adds a camera and a light if needed, renders the image, exports the GLB |
+| `studio/Dockerfile` | Image: Python 3.12, Blender 5.2 (official mirror, SHA-256 checksum verified), MCP server |
+| `k8s.yaml` | `studio3d` namespace, deployment, service, publishing of the renders only (Traefik), network rule with no egress |
+| `open-webui/headers.json` | Identity header to paste into the Open WebUI MCP connection |
+| `open-webui/system-prompt.txt` | System prompt of the “Studio 3D” model |
+| `.env.example` | Variable to fill in (shared token), without any value |
 
-## Prérequis
+## Prerequisites
 
-- Docker, `kubectl` et un cluster Kubernetes. La vidéo utilise **k3d** (cluster `tterm`, Traefik
-  publié sur le port 8080 de la machine).
-- **Open WebUI 0.11** déployé dans le même cluster (il joint le studio par le nom de son service).
-- Un modèle de langage capable d'appeler des outils (appel de fonction natif).
-- Environ 2 Go de mémoire et 2 processeurs pour le pod du studio.
+- Docker, `kubectl` and a Kubernetes cluster. The video uses **k3d** (cluster `tterm`, Traefik
+  published on port 8080 of the machine).
+- **Open WebUI 0.11** deployed in the same cluster (it reaches the studio by its service name).
+- A language model able to call tools (native function calling).
+- About 2 GB of memory and 2 CPUs for the studio pod.
 
-## Installation pas à pas
+## Step-by-step installation
 
-1. **Jeton partagé.** Copiez `.env.example` en `.env` et renseignez `STUDIO_JETON` (par exemple
-   `openssl rand -hex 24`). Ne le versionnez jamais.
+1. **Shared token.** Copy `.env.example` to `.env` and fill in `STUDIO_TOKEN` (for example
+   `openssl rand -hex 24`). Never commit it.
 
 2. **Image.**
 
    ```bash
    docker build -t studio3d:1 studio
-   k3d image import studio3d:1 -c tterm      # k3d ; sinon, poussez l'image dans votre registre
+   k3d image import studio3d:1 -c tterm      # k3d; otherwise, push the image to your registry
    ```
 
-3. **Secret, puis manifeste.**
+3. **Secret, then manifest.**
 
    ```bash
+   set -a; . ./.env; set +a
    kubectl create namespace studio3d
-   kubectl -n studio3d create secret generic studio --from-literal=jeton=$STUDIO_JETON
+   kubectl -n studio3d create secret generic studio --from-literal=token=$STUDIO_TOKEN
    kubectl apply -f k8s.yaml
    kubectl -n studio3d rollout status deployment/studio
    ```
 
-   Adaptez dans `k8s.yaml` l'adresse publique des rendus (`STUDIO_PUBLIC_URL`, hôte de
-   l'`Ingress`) à votre cluster.
+   In `k8s.yaml`, adapt the public address of the renders (`STUDIO_PUBLIC_URL`, `Ingress` host)
+   to your cluster.
 
-4. **Connexion dans Open WebUI** (compte administrateur) : Réglages d'administration ›
-   Intégrations › serveurs d'outils › « + » ; type **MCP** ; URL
-   `http://studio.studio3d.svc.cluster.local:8000/mcp` ; clé API : le jeton ; nom « Studio 3D »,
-   ID `studio` ; « Avancé » : coller le contenu de `open-webui/entetes.json` ; contrôle d'accès
-   « Public » ; « Vérifier la connexion », puis « Enregistrer ».
+4. **Connection in Open WebUI** (administrator account): Admin Panel › Settings › Integrations ›
+   tool servers › “+”; type **MCP**; URL `http://studio.studio3d.svc.cluster.local:8000/mcp`;
+   API key: the token; name “Studio 3D”, ID `studio`; “Advanced”: paste the contents of
+   `open-webui/headers.json`; access control “Public”; “Verify Connection”, then “Save”.
 
-5. **Modèle « Studio 3D »** (Espace de travail › Modèles › « + ») : modèle de base au choix,
-   prompt système `open-webui/consignes-modele.txt`, outil « Studio 3D », appel de fonction
-   natif, outils intégrés décochés, accès public.
+5. **“Studio 3D” model** (Workspace › Models › “+”): any base model, system prompt
+   `open-webui/system-prompt.txt`, tool “Studio 3D”, native function calling, builtin tools
+   unchecked, public access.
 
-6. **Essai.** Avec un compte utilisateur : « Crée une tasse rouge posée sur une table en bois,
-   avec une lumière chaude. », puis, une vingtaine de secondes plus tard, « Où en est la
-   première demande ? ». L'image s'affiche et l'objet 3D s'ouvre en artefact.
+6. **Try it.** With a user account: “Create a red mug on a wooden table, with warm lighting.”,
+   then, some twenty seconds later, “How is the first request going?”. The image appears and the
+   3D object opens as an artifact.
 
-Contrôles utiles : `kubectl -n studio3d port-forward svc/studio 8000:8000` puis
-`curl http://127.0.0.1:8000/sante`.
+Useful checks: `kubectl -n studio3d port-forward svc/studio 8000:8000`, then
+`curl http://127.0.0.1:8000/health`.
 
-## Sécurité
+## Security
 
-- Le point MCP (`/mcp`) n'est pas publié hors du cluster ; seuls les fichiers rendus (`/r/…`) le
-  sont, par des liens signés (HMAC) : un lien modifié renvoie 404.
-- Le code écrit par le modèle s'exécute dans un pod sans aucune connexion sortante
-  (`NetworkPolicy` `egress: []`, appliquée si votre réseau de cluster gère les règles réseau).
-- Exemple pédagogique : avant une mise en production, isolez Blender dans un conteneur distinct,
-  stockez les fichiers dans un stockage objet et gérez le jeton dans votre coffre de secrets.
+- The MCP endpoint (`/mcp`) is not published outside the cluster; only the rendered files (`/r/…`)
+  are, through signed links (HMAC): a tampered link returns 404.
+- The code written by the model runs in a pod without any outbound connection
+  (`NetworkPolicy` `egress: []`, enforced if your cluster network supports network policies).
+- Teaching example: before going to production, isolate Blender in a separate container, keep the
+  files in an object storage and manage the token in your secrets vault.
 
-## Suite de la série
+## Next in the series
 
-- Module suivant : **Passer le studio à l'échelle** (file Redis partagée, plusieurs workers
-  Blender, mise à l'échelle automatique par KEDA) — dépôt
+- Next module: **Scaling up the studio** (shared Redis queue, several Blender workers, automatic
+  scaling with KEDA) — repository
   [`clic-par-clic-studio3d-02-echelle`](https://github.com/guilhem-/clic-par-clic-studio3d-02-echelle).
 
-## Licence
+## License
 
-MIT, voir [`LICENSE`](LICENSE). Blender est distribué sous licence GPL par la Blender Foundation ;
-cette série est indépendante des éditeurs des logiciels présentés.
+MIT, see [`LICENSE`](LICENSE). Blender is distributed under the GPL license by the Blender
+Foundation; this series is independent of the publishers of the software shown.
